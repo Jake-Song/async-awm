@@ -1,66 +1,66 @@
 # AWM Async GRPO
 
-How to run [`openenv_awm_async_grpo.py`](openenv_awm_async_grpo.py) — async GRPO
-training for the Agent World Model (AWM) multi-turn MCP agent.
+How to run [`open-env/openenv_awm_async_grpo.py`](open-env/openenv_awm_async_grpo.py) —
+async GRPO training for the Agent World Model (AWM) multi-turn MCP agent.
 
 AWM is agentic: the model discovers MCP tools, calls them over several turns, and
-a verifier scores the final outcome. Training uses TRL's `AsyncGRPOTrainer` with
-an `environment_factory`, and a custom `AWMRolloutWorker` that scores each rollout
+a verifier scores the final outcome (`complete=1.0`, `incomplete=0.1`,
+`format_error=-1.0`). Training uses TRL's `AsyncGRPOTrainer` with an
+`environment_factory`, and a custom `AWMRolloutWorker` that scores each rollout
 out-of-band (the reward is never shown to the model).
 
 ## Topology
 
-Three processes, each on its own resource:
+An 8-GPU node, three processes:
 
-| Process       | Where        | Brings up                                            |
-|---------------|--------------|------------------------------------------------------|
-| AWM env server| CPU          | The MCP tools + verifier (FastAPI/uvicorn), port 8899|
-| vLLM server   | GPU 0        | Generation backend, port 8000, NCCL weight transfer  |
-| Trainer       | GPU 1 (or 1–7)| FSDP2 GRPO trainer; rollout worker runs on rank 0   |
+| Process        | Where          | Brings up                                              |
+|----------------|----------------|--------------------------------------------------------|
+| AWM env server | CPU            | The MCP tools + verifier (FastAPI/uvicorn), port 8899  |
+| vLLM server    | GPUs 0–5       | Generation backend, port 8000, NCCL weight transfer    |
+| Trainer        | GPUs 6,7       | FSDP2 GRPO trainer; rollout worker runs on rank 0      |
 
-The rollout worker only runs on rank 0, so all trainer ranks share the single
-vLLM server. Rollouts hit the env server synchronously over multiple turns, so
-throughput is bottlenecked by the env, not the GPU.
+vLLM runs `TP=2 × PP=3` across GPUs 0–5 (plain `TP=6` is invalid — the model's 32
+attention heads aren't divisible by 6). The rollout worker only runs on rank 0,
+so both trainer ranks share the single vLLM server. Rollouts hit the env server
+synchronously over multiple turns, so throughput is bottlenecked by the env, not
+the GPU.
 
 ## Prerequisites
 
-- A custom TRL fork at `../trl` (sibling of this repo). The async trainer's
-  `importance_sampling_level` / `loss_type` knobs and `model_init_kwargs` live
-  only in that fork — stock PyPI `trl` will fail with
+- A custom TRL fork at `../trl` (sibling of this repo), branch `AsyncGRPO`. The
+  async trainer's `importance_sampling_level` / `loss_type` knobs and
+  `model_init_kwargs` live only in that fork — stock PyPI `trl` will fail with
   `unexpected keyword argument`.
-- The AWM environment package from `../OpenEnv`.
+- The AWM environment package from `../OpenEnv`, branch `llm-judge-batch`.
 - An external LLM judge for the `sql` verifier (an OpenAI-compatible endpoint).
-- GPUs with FP8 tensor cores (Hopper/Ada/Blackwell) for the default FP8 trainer
-  config.
-- **OOD eval only** (`experiment/mcp_universe_eval.py`): MCP-Universe
-  **editable-installed from a clone** (`uv pip install -e ../MCP-Universe`, not a
-  plain wheel — its BenchmarkRunner resolves task-JSON paths against the installed
-  package dir), plus its live MCP servers and per-domain API keys
-  (finance/yfinance, `GOOGLE_MAPS_API_KEY`). Not needed for training.
+- An 8-GPU node (bf16 FSDP2 trainer). [`startup.sh`](startup.sh) provisions a
+  fresh cloud node: installs `uv`, clones both repos on the right branches, and
+  sets the MCP connection-pool env var.
 
 ## 1. Install
 
-From this `open-env/` directory:
+From the repo root:
 
 ```bash
-bash scripts/install_packages.sh
+bash open-env/scripts/install_packages.sh
 ```
 
 That runs (see the script for exact pins):
 
 ```bash
-uvx hf auth login                                   # Hugging Face login
 uv venv
 uv pip install -e ../trl[vllm]                      # the custom TRL fork
 uv pip install -U transformers
 uv pip install wandb bitsandbytes kernels==0.14.0
 uv pip install -e ../OpenEnv/envs/agent_world_model_env
 uv pip install python-dotenv
+uv pip install "fastapi<0.137"                       # >=0.137 breaks the vLLM metrics middleware
 ```
 
-Confirm the fork is the one in use:
+Log into Hugging Face and confirm the fork is the one in use:
 
 ```bash
+uvx hf auth login
 uv run python -c "import trl, os; print(trl.__version__, os.path.realpath(trl.__file__))"
 # -> 1.6.0.dev0 .../trl/trl/__init__.py   (NOT site-packages)
 ```
@@ -77,6 +77,9 @@ export OPENENV_AWM_LLM_API_KEY=sk-...
 export OPENENV_AWM_LLM_MODEL=your-judge-model
 ```
 
+(`OPENENV_AWM_LLM_BASE_URL` / `_MODEL` fall back to the `verifier:` section of
+`config.yaml` if unset; the API key must come from the env.)
+
 `huggingface_hub.login()` and `wandb.login()` run at startup. Set `HF_TOKEN` and
 `WANDB_API_KEY` to avoid interactive prompts (or pass `--no-push-to-hub` to skip
 the Hub upload).
@@ -87,73 +90,76 @@ the Hub upload).
 
 ```bash
 cd ../OpenEnv
+ulimit -n 65536
 PYTHONPATH=src:envs uv run uvicorn \
-  envs.agent_world_model_env.server.app:app --host 0.0.0.0 --port 8899
+  envs.agent_world_model_env.server.app:app --host 0.0.0.0 --port 8899 \
+  --ws-ping-interval 1800 --ws-ping-timeout 1800
 ```
 
-**Terminal 2 — vLLM server** (GPU 0):
+**Terminal 2 — vLLM server** (GPUs 0–5):
 
 ```bash
-bash scripts/run_vllm_awm.sh
+bash open-env/scripts/run_vllm_awm.sh
 ```
 
-**Terminal 3 — trainer** (GPU 1, single-GPU FP8 — the default):
+**Terminal 3 — trainer** (GPUs 6,7, FSDP2 — the default):
 
 ```bash
 export OPENENV_AWM_LLM_BASE_URL=... OPENENV_AWM_LLM_API_KEY=... OPENENV_AWM_LLM_MODEL=...
-bash scripts/run_trainer_awm.sh --env-url http://localhost:8899
+bash open-env/scripts/run_trainer_awm.sh --env-url http://localhost:8899
 ```
 
-`run_trainer_awm.sh` launches with `configs/accelerate_fp8_single_gpu.yaml` on
-`CUDA_VISIBLE_DEVICES=1`. Any extra args are forwarded to the script (see
-[Common flags](#common-flags)).
+`run_trainer_awm.sh` launches with `configs/fsdp2.yaml` (`num_processes: 2`,
+wraps `Qwen3DecoderLayer`) on `CUDA_VISIBLE_DEVICES=6,7`. Any extra args are
+forwarded to the script (see [Common flags](#common-flags)).
 
-### Multi-GPU (7 trainer GPUs, FSDP2)
+### Single trainer GPU
 
-To shard the trainer across GPUs 1–7 (8 GPUs total with vLLM on GPU 0), launch
-with the FSDP2 config instead of the single-GPU script:
+A single trainer GPU still works — launch `accelerate` directly instead of the
+script:
 
 ```bash
-CUDA_VISIBLE_DEVICES=1,2,3,4,5,6,7 \
-  uv run accelerate launch \
-    --config_file configs/fsdp2.yaml \
-    openenv_awm_async_grpo.py --env-url http://localhost:8899
+CUDA_VISIBLE_DEVICES=1 uv run accelerate launch \
+  open-env/openenv_awm_async_grpo.py --env-url http://localhost:8899
 ```
 
-`configs/fsdp2.yaml` sets `num_processes: 7` and wraps `Qwen3DecoderLayer`.
+## Configuration
 
-## Common flags
+Defaults live in [`open-env/config.yaml`](open-env/config.yaml) (loaded into the
+`CONFIG` dict at startup); CLI flags override them. Edit the YAML for durable
+changes, pass flags for one-offs.
 
-Defaults live in `parse_args()`. The ones you'll touch most:
+### Common flags
 
-| Flag                        | Default                          | Notes                                |
-|-----------------------------|----------------------------------|--------------------------------------|
-| `--model-id`                | `Qwen/Qwen3-4B-Thinking-2507`    | Policy + vLLM model                  |
-| `--env-url`                 | `http://localhost:8899`          | AWM env server                       |
-| `--num-generations`         | `8`                              | Rollouts per prompt (group size)     |
-| `--max-turns`               | `20`                             | Max tool-calling iterations          |
-| `--max-completion-length`   | `2048`                           | Tokens per completion                |
-| `--gradient-accumulation-steps` | `16`                         |                                      |
-| `--learning-rate`           | `7e-7`                           |                                      |
-| `--save-steps`              | `10`                             |                                      |
-| `--no-push-to-hub`          | (push is on by default)          | Skip the Hub upload                  |
-| `--output-dir`              | `Qwen/...-awm-async-grpo`        | Local + Hub repo                     |
-| `--wandb-project` / `--wandb-name` | `openenv-awm` / `awm-async-grpo` |                              |
+The ones you'll touch most:
+
+| Flag                        | Default                                       | Notes                              |
+|-----------------------------|-----------------------------------------------|------------------------------------|
+| `--model-id`                | `Jakemu/Qwen3-4B-Thinking-awm-async-grpo-100` | Policy + vLLM model (a checkpoint) |
+| `--env-url`                 | `http://localhost:8899`                       | AWM env server                     |
+| `--num-generations`         | `8`                                           | Rollouts per prompt (group size)   |
+| `--max-turns`               | `20`                                          | Max tool-calling iterations        |
+| `--max-completion-length`   | `4096`                                        | Tokens per completion              |
+| `--gradient-accumulation-steps` | `16`                                      |                                    |
+| `--learning-rate`           | `7e-7`                                         |                                    |
+| `--save-steps`              | `10`                                           |                                    |
+| `--no-push-to-hub`          | (push is on by default)                       | Skip the Hub upload                |
+| `--output-dir`              | `Qwen3-4B-Thinking-awm-async-grpo-200`        | Local + Hub repo                   |
+| `--wandb-project` / `--wandb-name` | `openenv-awm-continuous` / `awm-continuous-async-grpo-200` |            |
 
 ## Loss configuration
 
-The run uses **sequence-level importance sampling (GSPO)** with `loss_type="grpo"`
-and **no KL penalty** (`beta=0`). The async trainer has no reference model, and
-`old_log_probs` are vLLM *sampling* logprobs rather than reference logprobs, so a
-faithful KL term isn't available — see the comment in the config block. These
-knobs require the `../trl` fork.
+The run uses **token-level DAPO** (`loss_type="dapo"`,
+`importance_sampling_level="token"`) with **no KL penalty** (`beta=0`). DAPO's
+three filters are on by default (all in the `dapo:` block of `config.yaml`):
 
-## Known issues
+- **dynamic sampling** — drop groups where every rollout got the same reward (zero advantage),
+- **overlong filtering** — mask the loss of length-truncated episodes,
+- **soft overlong punishment** — length penalty as turns approach the cap.
 
-- `model_init_kwargs={"attn_implementation": "flash-attention_3"}` (config block,
-  ~line 385) is likely a typo — HF expects `flash_attention_2`,
-  `flash_attention_3`, or a `kernels-community/...` id. The hyphenated value can
-  raise at model load. Adjust to match your installed attention kernels.
+The async trainer has no reference model, and `old_log_probs` are vLLM *sampling*
+logprobs rather than reference logprobs, so a faithful KL term isn't available —
+see the comment in the config block. These knobs require the `../trl` fork.
 
 ## Troubleshooting
 
