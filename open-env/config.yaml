@@ -1,0 +1,67 @@
+model:
+  id: Jakemu/Qwen3-4B-Thinking-awm-async-grpo-100
+  resume_from_checkpoint: null
+
+environment:
+  url: http://localhost:8899
+  message_timeout_s: 1200.0
+  connect_timeout_s: 300.0
+  ws_ping_timeout_s: 1800.0
+  reset_concurrency: 384
+  verifier_mode: sql
+
+verifier:
+  llm_base_url: null
+  llm_model: null
+
+dataset:
+  size: 107
+  start: 107
+  num_scenarios: 100  # if set, size by unique-scenario coverage instead of size
+
+rollout:
+  num_generations: 8
+  max_turns: 20
+  context_window_turns: 3
+  max_completion_length: 4096
+  thinking_token_budget: null
+  # Sized for ~26% of rollouts dropped by the DAPO filters: oversample by
+  # 1/(1-0.26) ~= 1.35x. Scaling max_staleness (4 -> 6, ~1.5x) grows the auto
+  # max_inflight_tasks proportionally and widens the staleness window to match,
+  # so the extra rollouts aren't discarded as stale before the trainer uses them.
+  max_staleness: 6          # max policy-version lag a rollout may have before it's discarded
+  max_inflight_tasks: -1    # concurrent rollouts; -1 => auto (max_staleness * batch * grad_accum * num_processes)
+
+dapo:
+  loss_type: dapo                # grpo = per-sample mean loss; dapo = token-level loss
+  importance_sampling_level: token  # token = per-token ratios (GRPO/DAPO); sequence = GSPO; sequence_token = GSPO-token
+  dynamic_sampling: true        # drop zero-advantage (all-equal-reward) groups
+  overlong_filtering: true      # mask loss of length-truncated episodes
+  soft_overlong_punishment: true  # length penalty as turns approach the cap
+  soft_overlong_cache: null      # L_cache tokens; null => 20% of max_completion_length
+
+training:
+  output_dir: Qwen3-4B-Thinking-awm-async-grpo-200
+  gradient_accumulation_steps: 16
+  per_device_batch_size: 1
+  learning_rate: 7.0e-7
+  optim: adamw_torch_fused
+  max_steps: -1
+  num_epochs: 1
+
+checkpointing:
+  save_steps: 10
+  save_total_limit: null
+  logging_steps: 1
+
+vllm:
+  host: 127.0.0.1
+  port: 8000
+  timeout_s: 1200.0
+
+hub:
+  push_to_hub: true
+
+wandb:
+  project: openenv-awm-continuous
+  name: awm-continuous-async-grpo-200
