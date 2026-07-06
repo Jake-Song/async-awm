@@ -1,6 +1,6 @@
 # AWM Async GRPO
 
-How to run [`open-env/openenv_awm_async_grpo.py`](open-env/openenv_awm_async_grpo.py) —
+How to run [`awm/async_grpo_awm.py`](awm/async_grpo_awm.py) —
 async GRPO training for the Agent World Model (AWM) multi-turn MCP agent.
 
 AWM is agentic: the model discovers MCP tools, calls them over several turns, and
@@ -8,6 +8,42 @@ a verifier scores the final outcome (`complete=1.0`, `incomplete=0.1`,
 `format_error=-1.0`). Training uses TRL's `AsyncGRPOTrainer` with an
 `environment_factory`, and a custom `AWMRolloutWorker` that scores each rollout
 out-of-band (the reward is never shown to the model).
+
+## Repo layout
+
+```
+.
+├── awm/
+│   ├── async_grpo_awm.py            # main async-GRPO training script
+│   ├── config.yaml                  # default run config (CLI flags override)
+│   ├── configs/
+│   │   └── fsdp2.yaml               # accelerate FSDP2 config (6 sampling server and 2 trainer GPUs)
+│   ├── scripts/
+│   │   ├── install_packages.sh
+│   │   ├── run_vllm_awm.sh          # vLLM server (GPUs 0–5, TP=2×PP=3)
+│   │   ├── run_trainer_awm.sh       # FSDP2 trainer (GPUs 6,7)
+│   │   ├── patch_vllm_thinking_budget.py
+│   │   ├── check_judge_reliability.py
+│   │   ├── list_dataset_groups.py
+│   │   ├── simulate_gpu_allocation.py # simulation for optimal gpu allocation between sampling server and trainer
+│   │   └── simulate_judge_cost.py
+│   └── examples/
+│       ├── awm_simple.py
+│       └── awm_llm_judge.py
+├── experiment/
+│   ├── bfcl_to_awm.py               
+│   ├── bfcl_data_examples.jsonl
+│   ├── bfcl_data_examples.csv
+│   └── LOG.md                       # analysis of rollouts and calibration
+├── utils/
+│   ├── check_gpu_p2p.sh             # check if peer to peer communication of GPUs
+│   └── pretty_jsonl.py
+├── startup.sh                       # provision a fresh cloud node
+├── .env.example
+├── pyproject.toml
+├── CLAUDE.md
+└── README.md
+```
 
 ## Topology
 
@@ -42,7 +78,7 @@ the GPU.
 From the repo root:
 
 ```bash
-bash open-env/scripts/install_packages.sh
+bash awm/scripts/install_packages.sh
 ```
 
 That runs (see the script for exact pins):
@@ -65,13 +101,15 @@ uv run python -c "import trl, os; print(trl.__version__, os.path.realpath(trl.__
 # -> 1.6.0.dev0 .../trl/trl/__init__.py   (NOT site-packages)
 ```
 
-## 2. Configure the LLM judge
+## 2. Configure the ENV
 
 The `sql` verifier calls an external LLM-as-judge. The env's `reset()` reads
 these three variables, so export them (or put them in a `.env` file — the script
 calls `load_dotenv()`):
 
 ```bash
+export HF_TOKEN=
+export WANDB_API_KEY=            #if you want wandb logging
 export OPENENV_AWM_LLM_BASE_URL=https://your-openai-compatible-endpoint/v1
 export OPENENV_AWM_LLM_API_KEY=sk-...
 export OPENENV_AWM_LLM_MODEL=your-judge-model
@@ -99,14 +137,14 @@ PYTHONPATH=src:envs uv run uvicorn \
 **Terminal 2 — vLLM server** (GPUs 0–5):
 
 ```bash
-bash open-env/scripts/run_vllm_awm.sh
+bash awm/scripts/run_vllm_awm.sh
 ```
 
 **Terminal 3 — trainer** (GPUs 6,7, FSDP2 — the default):
 
 ```bash
 export OPENENV_AWM_LLM_BASE_URL=... OPENENV_AWM_LLM_API_KEY=... OPENENV_AWM_LLM_MODEL=...
-bash open-env/scripts/run_trainer_awm.sh --env-url http://localhost:8899
+bash awm/scripts/run_trainer_awm.sh --env-url http://localhost:8899
 ```
 
 `run_trainer_awm.sh` launches with `configs/fsdp2.yaml` (`num_processes: 2`,
@@ -120,12 +158,12 @@ script:
 
 ```bash
 CUDA_VISIBLE_DEVICES=1 uv run accelerate launch \
-  open-env/openenv_awm_async_grpo.py --env-url http://localhost:8899
+  awm/async_grpo_awm.py --env-url http://localhost:8899
 ```
 
 ## Configuration
 
-Defaults live in [`open-env/config.yaml`](open-env/config.yaml) (loaded into the
+Defaults live in [`awm/config.yaml`](awm/config.yaml) (loaded into the
 `CONFIG` dict at startup); CLI flags override them. Edit the YAML for durable
 changes, pass flags for one-offs.
 
@@ -147,17 +185,4 @@ The ones you'll touch most:
 | `--output-dir`              | `Qwen3-4B-Thinking-awm-async-grpo-200`        | Local + Hub repo                   |
 | `--wandb-project` / `--wandb-name` | `openenv-awm-continuous` / `awm-continuous-async-grpo-200` |            |
 
-## Loss configuration
-
-The run uses **token-level DAPO** (`loss_type="dapo"`,
-`importance_sampling_level="token"`) with **no KL penalty** (`beta=0`). DAPO's
-three filters are on by default (all in the `dapo:` block of `config.yaml`):
-
-- **dynamic sampling** — drop groups where every rollout got the same reward (zero advantage),
-- **overlong filtering** — mask the loss of length-truncated episodes,
-- **soft overlong punishment** — length penalty as turns approach the cap.
-
-The async trainer has no reference model, and `old_log_probs` are vLLM *sampling*
-logprobs rather than reference logprobs, so a faithful KL term isn't available —
-see the comment in the config block. These knobs require the `../trl` fork.
 
