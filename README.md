@@ -161,12 +161,3 @@ The async trainer has no reference model, and `old_log_probs` are vLLM *sampling
 logprobs rather than reference logprobs, so a faithful KL term isn't available —
 see the comment in the config block. These knobs require the `../trl` fork.
 
-## Troubleshooting
-
-- **`AsyncGRPOConfig got an unexpected keyword argument ...`** — the venv is using
-  stock PyPI `trl`, not the fork. Re-run `uv pip install -e ../trl[vllm]` and
-  recheck `trl.__file__`.
-- **vLLM-ready / empty-queue timeouts** — multi-turn env rollouts are slow; bump
-  `--vllm-server-timeout` (default 1200s).
-- **Judge `TimeoutError` during scoring** — verify `OPENENV_AWM_LLM_*` point at a
-  reachable endpoint; scoring failures are caught and scored `0.0`.
