@@ -92,15 +92,6 @@ uv pip install -e ../OpenEnv/envs/agent_world_model_env
 uv pip install python-dotenv
 uv pip install "fastapi<0.137"                       # >=0.137 breaks the vLLM metrics middleware
 ```
-
-Log into Hugging Face and confirm the fork is the one in use:
-
-```bash
-uvx hf auth login
-uv run python -c "import trl, os; print(trl.__version__, os.path.realpath(trl.__file__))"
-# -> 1.6.0.dev0 .../trl/trl/__init__.py   (NOT site-packages)
-```
-
 ## 2. Configure the ENV
 
 The `sql` verifier calls an external LLM-as-judge. The env's `reset()` reads
