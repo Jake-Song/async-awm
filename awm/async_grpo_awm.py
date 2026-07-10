@@ -72,6 +72,10 @@ from openenv.core.env_server.mcp_types import CallToolAction, ListToolsAction
 import openenv.core.env_client as _env_client
 from agent_world_model_env import AWMEnv
 from dotenv import load_dotenv
+try:
+    from .trajectory_utils import windowed_messages
+except ImportError:  # Direct execution: ``python awm/async_grpo_awm.py``
+    from trajectory_utils import windowed_messages
 load_dotenv()
 
 logger = logging.getLogger(__name__)
@@ -209,32 +213,42 @@ class AWMEnvironment:
         self.format_violation = False
         self.scenario = None
         self.task_idx = None
+        self.verifier_mode = ENVIRONMENT_CONFIG["verifier_mode"]
+        self.last_tool_reward_type = None
 
-    async def reset(self, scenario: str, task_idx: int, **kwargs) -> None:
+    async def reset(
+        self,
+        scenario: str,
+        task_idx: int,
+        verifier_mode: str | None = None,
+        **kwargs,
+    ) -> None:
         # kwargs absorbs the other dataset-row columns (prompt, task, ...).
         # The sql verifier's LLM judge is configured via OPENENV_AWM_LLM_* env
         # vars, which the env's reset() reads automatically.
         self.format_violation = False
         self.scenario = scenario
         self.task_idx = task_idx
+        self.verifier_mode = verifier_mode or ENVIRONMENT_CONFIG["verifier_mode"]
+        self.last_tool_reward_type = None
         # Semaphore covers only connect+reset (the subprocess-spawn phase) so
         # concurrent rollouts proceed freely once their env is initialized.
         async with _RESET_SEMAPHORE:
             await self.env.connect()
             await self.env.reset(
-            scenario=scenario,
-            task_idx=task_idx,
-            verifier_mode=ENVIRONMENT_CONFIG["verifier_mode"],
-            llm_base_url=(
-                os.environ.get("OPENENV_AWM_LLM_BASE_URL")
-                or VERIFIER_CONFIG["llm_base_url"]
-            ),
-            llm_api_key=os.environ.get("OPENENV_AWM_LLM_API_KEY"),
-            llm_model=(
-                os.environ.get("OPENENV_AWM_LLM_MODEL")
-                or VERIFIER_CONFIG["llm_model"]
-            ),
-        )
+                scenario=scenario,
+                task_idx=task_idx,
+                verifier_mode=self.verifier_mode,
+                llm_base_url=(
+                    os.environ.get("OPENENV_AWM_LLM_BASE_URL")
+                    or VERIFIER_CONFIG["llm_base_url"]
+                ),
+                llm_api_key=os.environ.get("OPENENV_AWM_LLM_API_KEY"),
+                llm_model=(
+                    os.environ.get("OPENENV_AWM_LLM_MODEL")
+                    or VERIFIER_CONFIG["llm_model"]
+                ),
+            )
 
     async def list_tools(self) -> str:
         """Discover every MCP tool available for this task. Call this FIRST.
@@ -257,6 +271,7 @@ class AWMEnvironment:
             to `call_tool`.
         """
         result = await self.env.step(ListToolsAction())
+        self.last_tool_reward_type = "tool_call_ok"
         return format_tools(result.observation.tools)
 
     async def call_tool(self, tool_name: str, arguments: dict) -> str:
@@ -285,6 +300,7 @@ class AWMEnvironment:
             arguments = {}
         result = await self.env.step(CallToolAction(tool_name=tool_name, arguments=arguments))
         obs = result.observation
+        self.last_tool_reward_type = getattr(obs, "reward_type", None)
         if getattr(obs, "reward_type", None) in _FORMAT_ERROR_REWARD_TYPES:
             self.format_violation = True
         if getattr(obs, "tool_result", None) is not None:
@@ -299,10 +315,9 @@ class AWMEnvironment:
     async def _score_rollout(self) -> tuple[float, str]:
         """Run the verifier on the finished episode. Not exposed to the model.
 
-        Uses the "sql" verifier only — the code-augmented LLM-as-Judge that the
-        AWM paper defines as the single outcome reward R_τ ∈ {1.0, 0.1, 0.0}.
-        (Pure "code" verification is deliberately excluded: the paper shows it
-        produces false negatives on partial/transient executions.)
+        Uses the configured verifier mode ("sql" by default). SQL is the
+        code-augmented LLM-as-Judge path used for RL; the SFT collector may
+        explicitly select deterministic "code" verification for cheaper probes.
 
         Status comes from the server's reward_type, not from the reward value:
         the env returns reward 0.0 for server-side scoring failures
@@ -327,7 +342,12 @@ class AWMEnvironment:
             "code_verify_error" or "llm_judge_error"), or "env_error:<ExceptionType>".
         """
         try:
-            r = await self.env.step(CallToolAction(tool_name="verify", arguments={"verifier_mode": "sql"}))
+            r = await self.env.step(
+                CallToolAction(
+                    tool_name="verify",
+                    arguments={"verifier_mode": self.verifier_mode},
+                )
+            )
             status = r.observation.reward_type
             if status in ("complete", "incomplete", "agent_error"):
                 return float(r.reward or 0.0), status
@@ -544,21 +564,7 @@ class AWMRolloutWorker(AsyncRolloutWorker):
         # the discovered tool list), and the CONTEXT_WINDOW_TURNS most recent turns.
         # `completion` holds only complete (assistant, tool) pairs here, so indices
         # are even and completion[i+1] is completion[i]'s tool result.
-        w = CONTEXT_WINDOW_TURNS
-        # Pin up to and including the assistant turn that calls list_tools; fall back
-        # to the first exchange if it hasn't been called yet.
-        pin_end = min(2, len(completion))
-        for i in range(0, len(completion), 2):
-            calls = completion[i].get("tool_calls") or []
-            if any(c["function"]["name"] == "list_tools" for c in calls):
-                pin_end = i + 2
-                break
-        recent_start = max(0, len(completion) - 2 * w)
-        if recent_start <= pin_end:
-            ctx = completion  # pinned prefix meets the recent window — no gap
-        else:
-            ctx = completion[:pin_end] + completion[recent_start:]
-        return list(prompt) + list(ctx)
+        return windowed_messages(prompt, completion, CONTEXT_WINDOW_TURNS)
 
     async def _execute_tool_calls(self, tool_calls, tool_dict):
         # Async override of the base (sync) dispatcher: the AWM env tools are now

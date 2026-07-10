@@ -152,6 +152,66 @@ CUDA_VISIBLE_DEVICES=1 uv run accelerate launch \
   awm/async_grpo_awm.py --env-url http://localhost:8899
 ```
 
+## Collect verified SFT demonstrations before RL
+
+[`awm/sft_dataset_awm.py`](awm/sft_dataset_awm.py) runs a teacher model through
+the same `list_tools` / `call_tool` interface and sliding context used by GRPO.
+It retries each task until it gets one SQL-verified success (three attempts by
+default), preserves every attempt for audit/resume, and derives per-turn records
+that TRL's `SFTTrainer` can consume directly.
+
+Start the AWM server as above and configure both the teacher and SQL judge:
+
+```bash
+export ENDPOINT_URL=https://your-openai-compatible-endpoint/v1
+export AWM_EXAMPLE_AGENT_MODEL=gpt-5-nano
+export OPENAI_API_KEY=sk-...  # falls back to OPENENV_AWM_LLM_API_KEY
+
+export OPENENV_AWM_LLM_BASE_URL=https://your-judge-endpoint/v1
+export OPENENV_AWM_LLM_API_KEY=sk-...
+export OPENENV_AWM_LLM_MODEL=your-judge-model
+
+uv run python -m awm.sft_dataset_awm collect \
+  --env-url http://localhost:8899 \
+  --output-dir awm-sft-data
+```
+
+The safe default selects 100 tasks with concurrency 16. Use `--dataset-start`,
+`--dataset-size`, `--num-scenarios`, `--max-attempts`, and `--concurrency` to
+change coverage. Collection resumes by default and refuses to mix incompatible
+configuration into an existing output directory.
+
+The output directory contains:
+
+- `episodes.jsonl`: all successful and failed attempts, rewards, statuses, full
+  transcripts, and teacher usage.
+- `sft.jsonl`: one conversational `prompt` / `completion` row per trainable
+  assistant turn, including the wrapper `tools` schemas expected by TRL.
+- `metadata.json`: immutable run configuration and collection summary.
+
+Validate the structural provenance, optionally rendering every row with the
+student tokenizer and reporting token-length percentiles:
+
+```bash
+uv run python -m awm.sft_dataset_awm validate --output-dir awm-sft-data
+uv run python -m awm.sft_dataset_awm validate \
+  --output-dir awm-sft-data \
+  --tokenizer Qwen/Qwen3-4B-Instruct-2507
+```
+
+Load the SFT rows with Hugging Face Datasets:
+
+```python
+from datasets import load_dataset
+
+train_dataset = load_dataset(
+    "json", data_files="awm-sft-data/sft.jsonl", split="train"
+)
+```
+
+Use conversational prompt-completion training with completion-only loss, then
+pass the resulting checkpoint to GRPO with `--model-id`.
+
 ## Configuration
 
 Defaults live in [`awm/config.yaml`](awm/config.yaml) (loaded into the
@@ -175,5 +235,3 @@ The ones you'll touch most:
 | `--no-push-to-hub`          | (push is on by default)                       | Skip the Hub upload                |
 | `--output-dir`              | `Qwen3-4B-Thinking-awm-async-grpo-200`        | Local + Hub repo                   |
 | `--wandb-project` / `--wandb-name` | `openenv-awm-continuous` / `awm-continuous-async-grpo-200` |            |
-
-
