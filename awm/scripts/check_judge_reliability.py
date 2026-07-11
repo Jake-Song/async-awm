@@ -1,30 +1,32 @@
-"""Replay AWM rollouts and measure LLM-judge reliability.
+"""Replay AWM rollouts and inspect or measure LLM-judge reasoning.
 
 Pipeline:
-  1. collect: replay rollouts into fresh AWM envs, run code/sql verifiers once,
-     and save frozen SQL-verifier payloads.
+  1. collect: replay the first rollout for each unique (scenario, task_idx) into
+     fresh AWM envs, run code/sql verifiers once, and save frozen SQL-verifier
+     payloads including the replayed judge's reasoning. Pass --all-rollouts to
+     collect every sampled trajectory instead.
   2. judge: rerun only the LLM judge N times per frozen payload and model.
   3. metrics: compute pairwise agreement, Fleiss-style kappa, and reward flips.
 
 Run from the repo root with the AWM env server already running.
 
 Usage:
-  # 1. Replay rollouts and freeze verifier outputs.
-  uv run python experiment/awm_judge_reliability.py collect \
+  # 1. Replay 200 unique tasks and freeze verifier outputs.
+  uv run python awm/scripts/check_judge_reliability.py collect \
     --rollouts /path/to/rollouts.jsonl \
     --output /path/to/judge_payloads.jsonl \
     --env-url http://localhost:8899 \
     --limit 200
 
   # 2. Rerun only the LLM judge over frozen SQL-verifier outputs.
-  uv run python experiment/awm_judge_reliability.py judge \
+  uv run python awm/scripts/check_judge_reliability.py judge \
     --payloads /path/to/judge_payloads.jsonl \
     --output /path/to/judge_votes.jsonl \
     --models openai/gpt-5.1 deepseek/deepseek-v4-flash \
     --votes 5
 
   # 3. Compute agreement, kappa, and reward-flip metrics.
-  uv run python experiment/awm_judge_reliability.py metrics \
+  uv run python awm/scripts/check_judge_reliability.py metrics \
     --votes /path/to/judge_votes.jsonl \
     --metrics-json /path/to/judge_reliability_metrics.json \
     --summary-md /path/to/judge_reliability_summary.md
@@ -247,17 +249,25 @@ async def collect_payloads(args: argparse.Namespace) -> None:
 
     written = 0
     seen = 0
+    seen_tasks: set[tuple[str, int]] = set()
     for line_no, rollout in read_jsonl(Path(args.rollouts)):
         if allowed and rollout.get("status") not in allowed:
             continue
+
+        scenario = rollout["scenario"]
+        task_idx = int(rollout["task_idx"])
+        task_key = (scenario, task_idx)
+        if not args.all_rollouts:
+            if task_key in seen_tasks:
+                continue
+            seen_tasks.add(task_key)
+
         seen += 1
         if args.limit and written >= args.limit:
             break
         if seen <= args.start:
             continue
 
-        scenario = rollout["scenario"]
-        task_idx = int(rollout["task_idx"])
         print(f"[collect] line={line_no} {scenario}#{task_idx}", flush=True)
         try:
             code = await replay_rollout(
@@ -529,8 +539,23 @@ def parse_args() -> argparse.Namespace:
     collect.add_argument("--rollouts", required=True)
     collect.add_argument("--output", default="judge_payloads.jsonl")
     collect.add_argument("--env-url", default=os.environ.get("AWM_BASE_URL", "http://localhost:8899"))
-    collect.add_argument("--limit", type=int, default=200, help="0 means all matching rollouts.")
-    collect.add_argument("--start", type=int, default=0, help="Skip this many matching rollouts.")
+    collect.add_argument(
+        "--limit",
+        type=int,
+        default=200,
+        help="Maximum unique tasks to collect; 0 means all matching tasks.",
+    )
+    collect.add_argument(
+        "--start", type=int, default=0, help="Skip this many matching unique tasks."
+    )
+    collect.add_argument(
+        "--all-rollouts",
+        action="store_true",
+        help=(
+            "Collect every matching rollout instead of only the first rollout for "
+            "each (scenario, task_idx); --limit and --start then count rollouts."
+        ),
+    )
     collect.add_argument(
         "--statuses",
         default="complete,incomplete,agent_error",
